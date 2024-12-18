@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net/http"
@@ -13,13 +14,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
+	"github.com/gin-gonic/gin"
 )
 
 const (
 	redirectURI  = "http://localhost:3000/callback"
 	authEndpoint = "https://accounts.spotify.com/authorize"
 	spotify_token_url = "https://accounts.spotify.com/api/token"
+	token_file = "token.json"
 )
 
 var (
@@ -46,11 +48,11 @@ func generateRandomString(n int) string {
 	return string(b)
 }
 
-func homeHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "Hello, World!")
+func HomeHandler(c *gin.Context) {
+	c.String(200, "Hello, World!")
 }
 
-func loginHandler(w http.ResponseWriter, r *http.Request) {
+func LoginHandler(c *gin.Context) {
 	state := generateRandomString(16)
 	scope := "user-read-private user-read-email"
 	// Construct the authorization URL
@@ -61,15 +63,15 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	params.Add("redirect_uri", redirectURI)
 	params.Add("state", state)
 	authURL := fmt.Sprintf("%s?%s", authEndpoint, params.Encode())
-	http.Redirect(w, r, authURL, http.StatusFound)
+	c.Redirect(http.StatusFound, authURL)
 }
 
-func callbackHandler(w http.ResponseWriter, r *http.Request) {
-	code := r.URL.Query().Get("code")
-	state := r.URL.Query().Get("state")
+func CallbackHandler(c *gin.Context) {
+	code := c.Query("code")
+	state := c.Query("state")
 	if state == "" {
 		// Redirect to error if state is missing
-		http.Redirect(w, r, "/#?error=state_mismatch", http.StatusFound)
+		c.Redirect(http.StatusFound, "/#?error=state_mismatch")
 		return
 	}
 
@@ -82,7 +84,7 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 	// Create HTTP POST request to Spotify API
 	req, err := http.NewRequest("POST", spotify_token_url, bytes.NewBufferString(form.Encode()))
 	if err != nil {
-		http.Error(w, "Failed to create request", http.StatusInternalServerError)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create request"})
 		return
 	}
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
@@ -92,21 +94,21 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		http.Error(w, "Failed to send request", http.StatusInternalServerError)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send request"})
 		return
 	}
 	defer resp.Body.Close()
 
 	// Handle the response
 	if resp.StatusCode != http.StatusOK {
-		http.Error(w, "Failed to retrieve token", resp.StatusCode)
+		c.JSON(resp.StatusCode, gin.H{"error": "Failed to retrieve token"})
 		return
 	}
 
 	// Parse the response body
 	var result RefreshToken
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		http.Error(w, "Failed to parse response", http.StatusInternalServerError)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse response"})
 		return
 	}
 
@@ -116,18 +118,17 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	log.Printf("Tokens successfully retrieved and stored: AccessToken=%s, RefreshToken=%s\n", refreshToken.AccessToken, refreshToken.RefreshToken)
-
-	// Return the result as JSON
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	saveToken(refreshToken)
+	c.JSON(http.StatusOK, result)
 }
 
-func getAccessTokenHandler(w http.ResponseWriter, r *http.Request) {
+func GetAccessTokenHandler(c *gin.Context) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if refreshToken.AccessToken == "" {
-		http.Error(w, "Access token not set", http.StatusNotFound)
+	refreshToken, err := loadToken()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err})
 		return
 	}
 
@@ -135,77 +136,91 @@ func getAccessTokenHandler(w http.ResponseWriter, r *http.Request) {
 		"access_token":  refreshToken.AccessToken,
 		"refresh_token": refreshToken.RefreshToken,
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	c.JSON(http.StatusOK, response)
 }
 
-func getRefreshToken() error {
-	// Form data for the request body
-	
+func RefreshTokenHandler(c *gin.Context) {
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken.RefreshToken)
 	form.Set("client_id", clientID)
 	fmt.Println(form)
 
-	// Create the HTTP POST request
 	req, err := http.NewRequest("POST", spotify_token_url, bytes.NewBufferString(form.Encode()))
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create request"})
+		return
 	}
-
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Authorization", authHeader)
-
 
 	// Send the request
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to send request: %w", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Errorf("failed to send request: %w", err)})
+		return
 	}
 	defer resp.Body.Close()
 
 	// Check for successful response
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed with status %s and code: %d", resp.Status, resp.StatusCode)
+		c.JSON(resp.StatusCode, gin.H{"error": fmt.Errorf("failed with status %s and code: %d", resp.Status, resp.StatusCode)})
+		return
 	}
 
 	// Parse the response body
 	var tokenData RefreshToken
 	if err := json.NewDecoder(resp.Body).Decode(&tokenData); err != nil {
-		return fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	// Save tokens (In Go, you can use a file, a database, or an in-memory cache)
-	fmt.Println("Access Token:", tokenData.AccessToken)
-	if tokenData.RefreshToken != "" {
-		fmt.Println("Refresh Token:", tokenData.RefreshToken)
-	}
-
-	return nil
-}
-
-func refreshTokenHandler(w http.ResponseWriter, r *http.Request) {
-	err := getRefreshToken()
-	if err != nil {
-		http.Error(w, fmt.Errorf("failed to refresh token: %s", err).Error(), http.StatusInternalServerError)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Errorf("failed to parse response: %w", err)})
 		return
 	}
 
-	msg := fmt.Sprintf("Token refreshed successfully! New refresh token is: %s, new access token is: %s", refreshToken.RefreshToken, refreshToken.AccessToken)
-	fmt.Fprintln(w, msg)
+	saveToken(tokenData)
+
+	response := map[string]string{
+		"access_token":  refreshToken.AccessToken,
+		"refresh_token": refreshToken.RefreshToken,
+	}
+	c.JSON(http.StatusOK, response)
 }
 
-func main() {
-	r := mux.NewRouter()
-	r.HandleFunc("/", homeHandler)
-	r.HandleFunc("/callback", callbackHandler)
-	r.HandleFunc("/login", loginHandler)
-	r.HandleFunc("/get-token", getAccessTokenHandler)
-	r.HandleFunc("/refresh", refreshTokenHandler)
-	
-	// Start the server
-	fmt.Println("Server is running on http://localhost:3000")
-	log.Fatal(http.ListenAndServe(":3000", r))
+func saveToken(refreshToken RefreshToken) {
+	// Open or create a file to write the JSON output
+	file, err := os.Create(token_file)
+	if err != nil {
+		log.Fatalf("Failed to create file: %v", err)
+	}
+	defer file.Close()
+
+	// Create a JSON encoder and write the token as JSON
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ") // Add indentation for pretty-printing
+	if err := encoder.Encode(refreshToken); err != nil {
+		log.Fatalf("Failed to encode JSON: %v", err)
+	}
+
+	log.Println("Token written to refresh_token.json")
+}
+
+func loadToken() (RefreshToken, error) {
+	var refreshToken RefreshToken
+	file, err := os.Open(token_file)
+	if err != nil {
+		return refreshToken, fmt.Errorf("failed to open file: %v", err)
+	}
+	defer file.Close()
+
+	// Read the file content
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		return refreshToken, fmt.Errorf("failed to read file: %v", err)
+	}
+
+	// Unmarshal JSON into the struct
+	if err := json.Unmarshal(content, &refreshToken); err != nil {
+		return refreshToken, fmt.Errorf("failed to decode JSON: %v", err)
+	}
+
+	return refreshToken, nil
 }
